@@ -138,6 +138,13 @@ type Options struct {
 	OnRelease                Callback
 	OnHeartbeat              func(HeartbeatEvent)
 	InitialSeq               uint64
+	// PinOrchestratorURL keeps OrchestratorURL as the control URL for the
+	// Runner's lifetime. A heartbeat response whose orchestrator field names
+	// any other base URL, including another path on the same origin, fails
+	// with ErrOrchestratorURLChanged before any Runner state changes or O2R
+	// starts. O2R URLs are still checked against AllowedOrigins. When false,
+	// a response may move the Runner to any allowed orchestrator URL.
+	PinOrchestratorURL bool
 }
 
 // HeartbeatApp is an app sent in a heartbeat.

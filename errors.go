@@ -1,6 +1,13 @@
 package liverunner
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrOrchestratorURLChanged reports a heartbeat response that tried to change
+// the orchestrator URL while Options.PinOrchestratorURL is set.
+var ErrOrchestratorURLChanged = errors.New("heartbeat response changed pinned orchestrator URL")
 
 type HTTPError struct {
 	StatusCode int

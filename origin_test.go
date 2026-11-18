@@ -461,3 +461,235 @@ func TestOriginPolicyValidatesRequestRouting(t *testing.T) {
 		}
 	}
 }
+
+func TestRunnerPinnedOrchestratorURL(t *testing.T) {
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		t.Errorf("request reached another orchestrator: %s", req.URL)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer other.Close()
+	for _, tt := range []struct {
+		name         string
+		orchestrator string // $ORIGIN is the configured origin; $OTHER is an allowed origin.
+		o2r          string // Empty omits O2R.
+		want         error  // Nil accepts; ErrOrchestratorURLChanged or a substring match otherwise.
+		wantText     string
+	}{
+		{name: "identical", orchestrator: "$ORIGIN/api", o2r: "$ORIGIN/o2r/second"},
+		{name: "trailing slash", orchestrator: "$ORIGIN/api/", o2r: "$ORIGIN/o2r/second"},
+		{name: "scheme case and default port", orchestrator: "HTTP://$HOST/api"},
+		{name: "omitted", o2r: "$ORIGIN/o2r/second"},
+		{name: "O2R on allowed origin", orchestrator: "$ORIGIN/api", o2r: "$OTHER/o2r/second"},
+		{name: "other path", orchestrator: "$ORIGIN/control", o2r: "$ORIGIN/o2r/second", want: ErrOrchestratorURLChanged},
+		{name: "root path", orchestrator: "$ORIGIN", o2r: "$ORIGIN/o2r/second", want: ErrOrchestratorURLChanged},
+		{name: "subpath", orchestrator: "$ORIGIN/api/v2", o2r: "$ORIGIN/o2r/second", want: ErrOrchestratorURLChanged},
+		{name: "path case", orchestrator: "$ORIGIN/API", o2r: "$ORIGIN/o2r/second", want: ErrOrchestratorURLChanged},
+		{name: "query", orchestrator: "$ORIGIN/api?x=1", o2r: "$ORIGIN/o2r/second", want: ErrOrchestratorURLChanged},
+		{name: "allowed origin", orchestrator: "$OTHER/api", o2r: "$ORIGIN/o2r/second", want: ErrOrchestratorURLChanged},
+		{name: "untrusted origin", orchestrator: "https://untrusted.example/api", o2r: "$ORIGIN/o2r/second", want: ErrOrchestratorURLChanged},
+		{name: "malformed", orchestrator: "file:///api", o2r: "$ORIGIN/o2r/second", wantText: "heartbeat response orchestrator"},
+		{name: "untrusted O2R", orchestrator: "$ORIGIN/api", o2r: "https://untrusted.example/o2r", wantText: "origin is not allowed"},
+	} {
+		for _, later := range []bool{false, true} {
+			for _, redirect := range []bool{false, true} {
+				name := tt.name + "/initial"
+				if later {
+					name = tt.name + "/later"
+				}
+				if redirect {
+					name += "/redirected"
+				}
+				t.Run(name, func(t *testing.T) {
+					testPinnedOrchestratorURL(t, other.URL, tt.orchestrator, tt.o2r, tt.want, tt.wantText, later, redirect)
+				})
+			}
+		}
+	}
+}
+
+func testPinnedOrchestratorURL(t *testing.T, otherURL, orchestrator, o2r string, want error, wantText string, later, redirect bool) {
+	ctx := context.Background()
+	rejected := want != nil || wantText != ""
+	var mu sync.Mutex
+	var paths []string
+	heartbeats := 0
+	orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		paths = append(paths, req.Method+" "+req.URL.Path)
+		expand := func(s string) string {
+			s = strings.ReplaceAll(s, "$ORIGIN", "http://"+req.Host)
+			s = strings.ReplaceAll(s, "$OTHER", otherURL)
+			return strings.ReplaceAll(s, "$HOST", req.Host)
+		}
+		switch req.URL.Path {
+		case "/api/runners/heartbeat":
+			if redirect {
+				// The client follows this redirect, but the pinned base must not change.
+				http.Redirect(w, req, "/moved/runners/heartbeat", http.StatusTemporaryRedirect)
+				return
+			}
+		case "/moved/runners/heartbeat":
+			if !redirect {
+				t.Errorf("unexpected request %s", req.URL.Path)
+			}
+		default:
+			// O2R readers stop after a 404. Requests are recorded so rejected
+			// channels can be checked after Close waits for every reader.
+			if !strings.HasPrefix(req.URL.Path, "/o2r/") {
+				t.Errorf("unexpected request %s", req.URL.Path)
+			}
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		heartbeats++
+		resp := HeartbeatResponse{
+			RunnerID: "owner", HeartbeatSecret: "secret-2", HeartbeatTTL: "2m", HeartbeatInterval: "2h",
+			Apps: []HeartbeatAppStatus{{ID: "generated", Status: "ready", SessionIDs: []string{}}},
+		}
+		if later && heartbeats == 1 {
+			resp = HeartbeatResponse{
+				RunnerID: "owner", Orchestrator: expand("$ORIGIN/api"), HeartbeatSecret: "secret-1", HeartbeatTTL: "1m", HeartbeatInterval: "1h",
+				Apps: []HeartbeatAppStatus{{ID: "generated", Status: "ready", SessionIDs: []string{}}},
+				O2R:  &Channel{URL: expand("$ORIGIN/o2r/first")},
+			}
+			if redirect {
+				resp.Orchestrator = expand("$ORIGIN/api/")
+			}
+		} else {
+			resp.Orchestrator = expand(orchestrator)
+			if o2r != "" {
+				resp.O2R = &Channel{URL: expand(o2r)}
+			}
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer orch.Close()
+
+	var events []HeartbeatEvent
+	runner, err := New(Options{
+		OrchestratorURL: orch.URL + "/api", PinOrchestratorURL: true, AllowedOrigins: []string{otherURL},
+		BootstrapSecret: "bootstrap", DisableUnregisterOnClose: true,
+		Apps:        []AppOptions{{App: "echo", RunnerURL: "https://runner.example"}},
+		HTTPClient:  &http.Client{},
+		OnHeartbeat: func(event HeartbeatEvent) { events = append(events, event) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runner.Close(ctx)
+
+	type state struct {
+		runnerID, secret, base string
+		appIDs                 []string
+		ttl, interval          time.Duration
+		o2r                    *Channel
+	}
+	snapshot := func() state {
+		return state{runner.RunnerID(), runner.HeartbeatSecret(), runner.OrchestratorURL(), runner.AppIDs(), runner.HeartbeatTTL(), runner.HeartbeatInterval(), runner.O2RChannel()}
+	}
+	if later {
+		if err := runner.sendHeartbeat(ctx); err != nil {
+			t.Fatalf("first heartbeat = %v", err)
+		}
+	}
+	before := snapshot()
+	err = runner.sendHeartbeat(ctx)
+
+	wantEvents := 1
+	if later {
+		wantEvents = 2
+	}
+	if len(events) != wantEvents || events[0].Err != nil && later {
+		t.Fatalf("heartbeat events = %#v", events)
+	}
+	last := events[len(events)-1]
+	if last.Err != err {
+		t.Fatalf("OnHeartbeat error = %v, returned %v", last.Err, err)
+	}
+	if rejected {
+		if want != nil && !errors.Is(err, want) || wantText != "" && (err == nil || !strings.Contains(err.Error(), wantText)) {
+			t.Fatalf("heartbeat error = %v, want %v %q", err, want, wantText)
+		}
+		if last.Response != nil || last.AcceptedSeq != nil || last.TTL != 0 {
+			t.Fatalf("rejected heartbeat event = %#v", last)
+		}
+		if got := snapshot(); !reflect.DeepEqual(got, before) {
+			t.Fatalf("rejected response changed state from %#v to %#v", before, got)
+		}
+		wantSecret, wantApps := "", []string{""}
+		if later {
+			wantSecret, wantApps = "secret-1", []string{"generated"}
+		}
+		if before.secret != wantSecret || !reflect.DeepEqual(before.appIDs, wantApps) || before.base != orch.URL+"/api" {
+			t.Fatalf("unexpected baseline state %#v", before)
+		}
+	} else {
+		if err != nil || last.Response == nil {
+			t.Fatalf("heartbeat = %v", err)
+		}
+		if runner.OrchestratorURL() != orch.URL+"/api" || runner.HeartbeatSecret() != "secret-2" || !reflect.DeepEqual(runner.AppIDs(), []string{"generated"}) {
+			t.Fatalf("accepted response state = %#v", snapshot())
+		}
+		if o2r != "" && (runner.O2RChannel() == nil || !strings.HasSuffix(runner.O2RChannel().URL, "/o2r/second")) {
+			t.Fatalf("accepted O2R = %#v", runner.O2RChannel())
+		}
+	}
+
+	if err := runner.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, path := range paths {
+		if rejected && strings.HasPrefix(path, "GET /o2r/second") {
+			t.Fatalf("rejected response started O2R: %v", paths)
+		}
+	}
+	if heartbeats != wantEvents {
+		t.Fatalf("heartbeats = %d, paths = %v", heartbeats, paths)
+	}
+}
+
+func TestRunnerUnpinnedOrchestratorPathChange(t *testing.T) {
+	orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		json.NewEncoder(w).Encode(HeartbeatResponse{
+			RunnerID: "owner", Orchestrator: "http://" + req.Host + "/control", HeartbeatTTL: "1m",
+			Apps: []HeartbeatAppStatus{{ID: "echo", Status: "ready", SessionIDs: []string{}}},
+		})
+	}))
+	defer orch.Close()
+	runner, err := New(Options{
+		OrchestratorURL: orch.URL + "/api", BootstrapSecret: "bootstrap", DisableUnregisterOnClose: true,
+		Apps: []AppOptions{{ID: "echo", App: "echo", RunnerURL: "https://runner.example"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runner.Close(context.Background())
+	if err := runner.sendHeartbeat(context.Background()); err != nil || runner.OrchestratorURL() != orch.URL+"/control" {
+		t.Fatalf("unpinned path change = %v, base %q", err, runner.OrchestratorURL())
+	}
+}
+
+func TestSameBase(t *testing.T) {
+	for _, tt := range []struct {
+		a, b string
+		want bool
+	}{
+		{"https://orch.example/api", "https://orch.example/api/", true},
+		{"https://orch.example/api", "HTTPS://ORCH.example:443/api", true},
+		{"http://orch.example", "http://orch.example:80/", true},
+		{"https://orch.example/api", "https://orch.example/API", false},
+		{"https://orch.example/api", "https://orch.example", false},
+		{"https://orch.example/api", "http://orch.example/api", false},
+		{"https://orch.example/api", "https://orch.example:8443/api", false},
+		{"https://orch.example/api", "https://orch.example/api?x", false},
+		{"https://orch.example/a%2Fb", "https://orch.example/a/b", false},
+		{"https://orch.example/api", "file:///api", false},
+	} {
+		if got := sameBase(tt.a, tt.b); got != tt.want {
+			t.Errorf("sameBase(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}

@@ -25,6 +25,7 @@ type Runner struct {
 	mu sync.Mutex
 
 	orchestratorURL string
+	pinnedURL       string // Immutable; empty unless Options.PinOrchestratorURL.
 	origins         originPolicy
 	bootstrapSecret string
 	heartbeatSecret string
@@ -62,6 +63,10 @@ func New(opts Options) (*Runner, error) {
 	if strings.TrimSpace(opts.BootstrapSecret) == "" {
 		return nil, errors.New("bootstrap secret is required")
 	}
+	pinned := ""
+	if opts.PinOrchestratorURL {
+		pinned = base
+	}
 	apps, err := newAppRequests(opts.Apps)
 	if err != nil {
 		return nil, err
@@ -85,6 +90,7 @@ func New(opts Options) (*Runner, error) {
 		onHeartbeat:       opts.OnHeartbeat,
 		seq:               opts.InitialSeq,
 		orchestratorURL:   base,
+		pinnedURL:         pinned,
 		origins:           origins,
 		bootstrapSecret:   opts.BootstrapSecret,
 		heartbeatSecret:   opts.HeartbeatSecret,
@@ -503,7 +509,15 @@ func (r *Runner) applyHeartbeatResponse(resp *HeartbeatResponse, req HeartbeatRe
 		return errors.New("heartbeat response did not echo submitted seq")
 	}
 	base := ""
-	if resp.Orchestrator != "" {
+	if resp.Orchestrator != "" && r.pinnedURL != "" {
+		// The pinned URL is never replaced, so any other base is rejected.
+		if _, err := parseOriginURL(resp.Orchestrator); err != nil {
+			return fmt.Errorf("heartbeat response orchestrator: %w", err)
+		}
+		if !sameBase(resp.Orchestrator, r.pinnedURL) {
+			return ErrOrchestratorURLChanged
+		}
+	} else if resp.Orchestrator != "" {
 		if err := r.origins.validate(resp.Orchestrator); err != nil {
 			return fmt.Errorf("heartbeat response orchestrator: %w", err)
 		}

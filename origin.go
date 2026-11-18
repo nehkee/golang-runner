@@ -67,6 +67,23 @@ func httpOrigin(u *url.URL) string {
 	return u.Scheme + "://" + net.JoinHostPort(host, port)
 }
 
+// sameBase reports whether two base URLs normalize to the same origin, path,
+// and query. Scheme and host case, default ports, and trailing slashes are
+// ignored; any other path difference is significant.
+func sameBase(a, b string) bool {
+	a, errA := normalizeBase(a)
+	b, errB := normalizeBase(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	ua, errA := parseOriginURL(a)
+	ub, errB := parseOriginURL(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return httpOrigin(ua) == httpOrigin(ub) && ua.EscapedPath() == ub.EscapedPath() && ua.RawQuery == ub.RawQuery && ua.ForceQuery == ub.ForceQuery
+}
+
 func (p originPolicy) validate(raw string) error {
 	u, err := parseOriginURL(raw)
 	if err != nil {
